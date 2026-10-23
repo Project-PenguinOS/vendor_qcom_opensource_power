@@ -1,6 +1,6 @@
 LOCAL_PATH := $(call my-dir)
 
-ifeq ($(call is-vendor-board-platform,QCOM),true)
+ifneq (,$(filter true,$(call is-vendor-board-platform,QCOM) $(TARGET_USES_QTI_POWER_HAL)))
 
 # HAL module implemenation stored in
 # hw/<POWERS_HARDWARE_MODULE_ID>.<ro.hardware>.so
