@@ -29,6 +29,10 @@ class LaminarController {
 
   private:
     void applyLocked(int value);
+    void armIdle();
+    void resetIfIdle();
+
+    friend void laminarIdleLoop();
 
     std::mutex mLock;
     std::vector<int32_t> mThreads;

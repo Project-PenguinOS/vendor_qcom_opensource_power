@@ -9,9 +9,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <sys/syscall.h>
+#include <thread>
+#include <unordered_map>
 #include <unistd.h>
 
 #include <android-base/logging.h>
@@ -29,6 +33,8 @@ constexpr int kQuietFramesBeforeLowering = 2;
 constexpr int kMinStep = 24;
 constexpr int kApplyThreshold = 16;
 constexpr int kLoadUpFloor = 512;
+// A session that stops reporting frames is idle; its floor drops back after this long.
+constexpr auto kIdleReset = std::chrono::milliseconds(150);
 
 constexpr uint64_t kKeepAll = 0x18;
 constexpr uint64_t kUtilClampMin = 0x20;
@@ -55,11 +61,43 @@ bool setUtilMin(int32_t tid, int value) {
     return syscall(__NR_sched_setattr, tid, &attr, 0) == 0;
 }
 
+std::mutex gIdleLock;
+std::condition_variable gIdleCv;
+std::unordered_map<LaminarController*, std::chrono::steady_clock::time_point> gIdleDeadlines;
+std::once_flag gIdleThreadOnce;
+
 }  // namespace
+
+void laminarIdleLoop() {
+    std::unique_lock<std::mutex> lock(gIdleLock);
+    while (true) {
+        if (gIdleDeadlines.empty()) {
+            gIdleCv.wait(lock);
+            continue;
+        }
+        auto next = std::chrono::steady_clock::time_point::max();
+        for (const auto& [controller, deadline] : gIdleDeadlines) next = std::min(next, deadline);
+        gIdleCv.wait_until(lock, next);
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = gIdleDeadlines.begin(); it != gIdleDeadlines.end();) {
+            if (it->second <= now) {
+                // Reset under gIdleLock so a controller being destroyed waits for it.
+                it->first->resetIfIdle();
+                it = gIdleDeadlines.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+}
 
 LaminarController::LaminarController(const std::vector<int32_t>& threads) : mThreads(threads) {}
 
 LaminarController::~LaminarController() {
+    {
+        std::lock_guard<std::mutex> lock(gIdleLock);
+        gIdleDeadlines.erase(this);
+    }
     reset();
 }
 
@@ -82,34 +120,57 @@ void LaminarController::setTarget(int64_t targetNanos) {
 }
 
 void LaminarController::report(int64_t actualNanos) {
-    std::lock_guard<std::mutex> lock(mLock);
-    double ratio = static_cast<double>(actualNanos) / static_cast<double>(mTargetNanos);
-    if (ratio > 1.0) {
-        int step = std::max(kMinStep, static_cast<int>(kRaiseGain * (ratio - 1.0) * kMaxFloor));
-        mFloor = std::min(kMaxFloor, mFloor + step);
-        mQuietFrames = 0;
-    } else if (ratio < kRoomRatio) {
-        if (++mQuietFrames >= kQuietFramesBeforeLowering) {
-            int step = std::max(kMinStep / 2,
-                                static_cast<int>(kLowerGain * (kRoomRatio - ratio) * kMaxFloor));
-            mFloor = std::max(0, mFloor - step);
-        }
-    } else {
-        mQuietFrames = 0;
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        double ratio = static_cast<double>(actualNanos) / static_cast<double>(mTargetNanos);
+        if (ratio > 1.0) {
+            int step = std::max(kMinStep, static_cast<int>(kRaiseGain * (ratio - 1.0) * kMaxFloor));
+            mFloor = std::min(kMaxFloor, mFloor + step);
+            mQuietFrames = 0;
+        } else if (ratio < kRoomRatio) {
+            if (++mQuietFrames >= kQuietFramesBeforeLowering) {
+                int step = std::max(kMinStep / 2,
+                                    static_cast<int>(kLowerGain * (kRoomRatio - ratio) * kMaxFloor));
+                mFloor = std::max(0, mFloor - step);
+            }
+        } else {
+            mQuietFrames = 0;
     }
     applyLocked(mFloor);
+    }
+    armIdle();
 }
 
 void LaminarController::loadUp() {
-    std::lock_guard<std::mutex> lock(mLock);
-    mFloor = std::max(mFloor, kLoadUpFloor);
-    applyLocked(mFloor);
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        mFloor = std::max(mFloor, kLoadUpFloor);
+        applyLocked(mFloor);
+    }
+    armIdle();
 }
 
 void LaminarController::loadSpike() {
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        mFloor = kMaxFloor;
+        applyLocked(mFloor);
+    }
+    armIdle();
+}
+
+void LaminarController::armIdle() {
+    std::call_once(gIdleThreadOnce, [] { std::thread(laminarIdleLoop).detach(); });
+    std::lock_guard<std::mutex> lock(gIdleLock);
+    gIdleDeadlines[this] = std::chrono::steady_clock::now() + kIdleReset;
+    gIdleCv.notify_one();
+}
+
+void LaminarController::resetIfIdle() {
     std::lock_guard<std::mutex> lock(mLock);
-    mFloor = kMaxFloor;
-    applyLocked(mFloor);
+    mFloor = 0;
+    mQuietFrames = 0;
+    applyLocked(0);
 }
 
 void LaminarController::reset() {
