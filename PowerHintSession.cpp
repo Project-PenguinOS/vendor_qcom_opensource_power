@@ -242,6 +242,7 @@ PowerHintSessionImpl::PowerHintSessionImpl(int32_t tgid, int32_t uid, const std:
     mTLBHandle = -1;
     mTLBoostSum = 0;
     mIsTopAppGame = false;
+    if (LaminarController::enabled()) mLaminar = std::make_unique<LaminarController>(threadIds);
     updateTargetWorkDuration(durationNanos); // mTargetWorkDurationNanos, mThresholdNanos
     setSessionActivity(this, true);
 }
@@ -309,12 +310,13 @@ double PowerHintSessionImpl::nextSupportedFPS(double fps) {
 
 ndk::ScopedAStatus PowerHintSessionImpl::updateTargetWorkDuration(int64_t in_targetDurationNanos){
     // TODO: top app is game check
-    LOG(INFO) << "PowerHintSessionImpl::updateTargetWorkDuration: " << in_targetDurationNanos;
+    if (mDebug) LOG(INFO) << "PowerHintSessionImpl::updateTargetWorkDuration: " << in_targetDurationNanos;
     if (in_targetDurationNanos <= 0) {
         LOG(ERROR) << "Invalid target work duration";
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
     }
     mTargetWorkDurationNanos = in_targetDurationNanos;
+    if (mLaminar) mLaminar->setTarget(in_targetDurationNanos);
     mThresholdNanos = mTargetWorkDurationNanos - (mTargetWorkDurationNanos/8);
     double durationInSeconds = static_cast<double>(mTargetWorkDurationNanos)/1'000'000'000.0;
     double calculatedFps = 1.0/durationInSeconds;
@@ -326,7 +328,7 @@ ndk::ScopedAStatus PowerHintSessionImpl::updateTargetWorkDuration(int64_t in_tar
 
 ndk::ScopedAStatus PowerHintSessionImpl::reportActualWorkDuration(const std::vector<::aidl::android::hardware::power::WorkDuration>& in_durations){
     // TODO: top app is game check
-    LOG(INFO) << "PowerHintSessionImpl::reportActualWorkDuration: ";
+    if (mDebug) LOG(INFO) << "PowerHintSessionImpl::reportActualWorkDuration: ";
     int64_t targetWorkDurationNanos = mTargetWorkDurationNanos;
     if (targetWorkDurationNanos == -1 || in_durations.empty()) {
         return ndk::ScopedAStatus::ok();
@@ -338,6 +340,10 @@ ndk::ScopedAStatus PowerHintSessionImpl::reportActualWorkDuration(const std::vec
         }
     }
     if (mDebug) LOG(INFO) << "actual = " << actualWorkDurationNanos << " ns, target = " << targetWorkDurationNanos << " ns, last_boost = " << mTLBoostSum;
+    if (mLaminar) {
+        mLaminar->report(actualWorkDurationNanos);
+        return ndk::ScopedAStatus::ok();
+    }
     if (actualWorkDurationNanos >= mThresholdNanos) {
         taskLoadBoost(LOAD_UP);
         mConsecutiveDownCount = 0;
@@ -353,15 +359,16 @@ ndk::ScopedAStatus PowerHintSessionImpl::reportActualWorkDuration(const std::vec
     return ndk::ScopedAStatus::ok();
 }
 ndk::ScopedAStatus PowerHintSessionImpl::pause(){
-    LOG(INFO) << "PowerHintSessionImpl::pause ";
+    if (mDebug) LOG(INFO) << "PowerHintSessionImpl::pause ";
     if (isSessionAlive(this)) {
+        if (mLaminar) mLaminar->reset();
         sendHint(aidl::android::hardware::power::SessionHint::CPU_LOAD_RESET);
         setSessionActivity(this, false);
     }
     return ndk::ScopedAStatus::ok();
 }
 ndk::ScopedAStatus PowerHintSessionImpl::resume(){
-    LOG(INFO) << "PowerHintSessionImpl::resume ";
+    if (mDebug) LOG(INFO) << "PowerHintSessionImpl::resume ";
     if (isSessionAlive(this)) {
         sendHint(aidl::android::hardware::power::SessionHint::CPU_LOAD_RESUME);
         setSessionActivity(this, true);
@@ -369,8 +376,9 @@ ndk::ScopedAStatus PowerHintSessionImpl::resume(){
     return ndk::ScopedAStatus::ok();
 }
 ndk::ScopedAStatus PowerHintSessionImpl::close(){
-    LOG(INFO) << "PowerHintSessionImpl::close ";
+    if (mDebug) LOG(INFO) << "PowerHintSessionImpl::close ";
     if (isSessionAlive(this)) {
+        if (mLaminar) mLaminar->reset();
         sendHint(aidl::android::hardware::power::SessionHint::CPU_LOAD_RESET);
         taskLoadBoost(LOAD_RESET);
         releaseLowCpuUtil();
@@ -384,9 +392,24 @@ ndk::ScopedAStatus PowerHintSessionImpl::close(){
     return ndk::ScopedAStatus::ok();
 }
 ndk::ScopedAStatus PowerHintSessionImpl::sendHint(aidl::android::hardware::power::SessionHint hint){
-    LOG(INFO) << "PowerHintSessionImpl::sendHint ";
+    if (mDebug) LOG(INFO) << "PowerHintSessionImpl::sendHint ";
     if (!isSessionActive(this))
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+    if (mLaminar) {
+        switch (hint) {
+            case aidl::android::hardware::power::SessionHint::CPU_LOAD_UP:
+                mLaminar->loadUp();
+                return ndk::ScopedAStatus::ok();
+            case aidl::android::hardware::power::SessionHint::CPU_LOAD_SPIKE:
+                mLaminar->loadSpike();
+                return ndk::ScopedAStatus::ok();
+            case aidl::android::hardware::power::SessionHint::CPU_LOAD_RESET:
+                mLaminar->reset();
+                return ndk::ScopedAStatus::ok();
+            default:
+                break;
+        }
+    }
     switch (hint)
     {
         case aidl::android::hardware::power::SessionHint::CPU_LOAD_UP:
@@ -416,6 +439,7 @@ ndk::ScopedAStatus PowerHintSessionImpl::setThreads(const std::vector<int32_t>& 
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
     }
     mThreadIds = threadIds;
+    if (mLaminar) mLaminar->setThreads(threadIds);
 
     // reset task load boost
     mConsecutiveDownCount = 0;

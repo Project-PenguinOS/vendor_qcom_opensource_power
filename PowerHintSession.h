@@ -8,7 +8,10 @@
 
 #include <unordered_map>
 #include <set>
+#include <memory>
 #include <mutex>
+
+#include "Laminar.h"
 
 #include <aidl/android/hardware/power/WorkDuration.h>
 #include <aidl/android/hardware/power/SessionHint.h>
@@ -70,6 +73,7 @@ private:
 
     // TODO: get info from Qape and WLC
     std::string mTopAppName;
+    std::unique_ptr<LaminarController> mLaminar;
     bool mIsTopAppGame;
 };
 #endif /* __POWERHINTSESSION__ */

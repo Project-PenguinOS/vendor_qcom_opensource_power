@@ -176,7 +176,6 @@ ndk::ScopedAStatus Power::isBoostSupported(Boost type, bool* _aidl_return) {
 }
 
 ndk::ScopedAStatus Power::getCpuHeadroom(const CpuHeadroomParams& cpuHeadroomParams, CpuHeadroomResult* cpuHeadroomResult) {
-    LOG(INFO) << "Power getCpuHeadroom";
     int durationMillis = cpuHeadroomParams.calculationWindowMillis;
     if (durationMillis > CPU_MAX_DURATION_MS) {
         return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
@@ -188,7 +187,9 @@ ndk::ScopedAStatus Power::getCpuHeadroom(const CpuHeadroomParams& cpuHeadroomPar
     int args[] = { CPU_HEADROOM_TOTAL, durationMillis / 1000 };
     int headroom = send_perf_get_feedback_extn(VENDOR_FEEDBACK_CPU_HEADROOM, pkg, 2, args);
     if (headroom < 0) {
-        LOG(ERROR) << "Failed to get CPU headroom";
+        static bool sCpuLogged = false;
+        if (!sCpuLogged) LOG(ERROR) << "Failed to get CPU headroom";
+        sCpuLogged = true;
         return ndk::ScopedAStatus::ok();
     }
     cpuHeadroomResult->set<CpuHeadroomResult::Tag::globalHeadroom>(static_cast<float>(headroom));
@@ -196,7 +197,6 @@ ndk::ScopedAStatus Power::getCpuHeadroom(const CpuHeadroomParams& cpuHeadroomPar
 }
 
 ndk::ScopedAStatus Power::getGpuHeadroom(const GpuHeadroomParams& gpuHeadroomParams, GpuHeadroomResult* gpuHeadroomResult) {
-    LOG(INFO) << "Power getGpuHeadroom";
     int calculationType = -1;
     if (gpuHeadroomParams.calculationType == GpuHeadroomParams::CalculationType::MIN) {
         calculationType = GPU_HEADROOM_MIN;
@@ -216,7 +216,9 @@ ndk::ScopedAStatus Power::getGpuHeadroom(const GpuHeadroomParams& gpuHeadroomPar
     int args[] = { calculationType, durationMillis / 1000 };
     int headroom = send_perf_get_feedback_extn(VENDOR_FEEDBACK_GPU_HEADROOM, pkg, 2, args);
     if (headroom < 0) {
-       LOG(ERROR) << "Failed to get GPU headroom";
+       static bool sGpuLogged = false;
+       if (!sGpuLogged) LOG(ERROR) << "Failed to get GPU headroom";
+       sGpuLogged = true;
        return ndk::ScopedAStatus::ok();
     }
     gpuHeadroomResult->set<GpuHeadroomResult::Tag::globalHeadroom>(static_cast<float>(headroom));
@@ -247,20 +249,10 @@ ndk::ScopedAStatus Power::createHintSessionWithConfig(
     return out;
 }
 
-ndk::ScopedAStatus Power::getSessionChannel(int32_t, int32_t, ChannelConfig* _aidl_return) {
-    static AidlMessageQueue<ChannelMessage, SynchronizedReadWrite> stubQueue{20, true};
-    static std::thread stubThread([&] {
-        ChannelMessage data;
-        // This loop will only run while there is data waiting
-        // to be processed, and blocks on a futex all other times
-        while (stubQueue.readBlocking(&data, 1, 0)) {
-        }
-    });
-    _aidl_return->channelDescriptor = stubQueue.dupeDesc();
-    _aidl_return->readFlagBitmask = 0x01;
-    _aidl_return->writeFlagBitmask = 0x02;
-    _aidl_return->eventFlagDescriptor = std::nullopt;
-    return ndk::ScopedAStatus::ok();
+ndk::ScopedAStatus Power::getSessionChannel(int32_t, int32_t, ChannelConfig*) {
+    // Sessions report work durations through binder so they reach the hint sessions; a channel
+    // nobody reads would drop them.
+    return ndk::ScopedAStatus::fromExceptionCode(EX_UNSUPPORTED_OPERATION);
 }
 
 ndk::ScopedAStatus Power::closeSessionChannel(int32_t, int32_t) {
