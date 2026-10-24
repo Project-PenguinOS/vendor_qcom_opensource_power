@@ -25,11 +25,6 @@
  * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Changes from Qualcomm Technologies, Inc. are provided under the following license:
- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
- * SPDX-License-Identifier: BSD-3-Clause-Clear
- *
  */
 #define LOG_NIDEBUG 0
 
@@ -63,6 +58,7 @@ static int (*perf_lock_rel)(int handle);
 static int (*perf_hint)(int, const char *, int, int);
 static int (*perf_get_feedback)(int, const char*);
 static int (*perf_get_feedback_extn)(int, const char*, int, int[]);
+static void (*perf_event)(int, const char*, int, int[]);
 static const char* (*perf_sync_request)(int);
 static PropVal (*perf_get_prop)(const char *prop , const char *def_val);
 static struct list_node active_hint_list_head;
@@ -110,6 +106,26 @@ static void __attribute__ ((constructor)) initialize(void)
 
         if (!perf_hint) {
             ALOGE("Unable to get perf_hint function handle.\n");
+        }
+
+        perf_get_feedback = dlsym(qcopt_handle, "perf_get_feedback");
+        if (!perf_get_feedback) {
+            ALOGE("Unable to get perf_get_feedback function handle.\n");
+        }
+
+        perf_get_feedback_extn = dlsym(qcopt_handle, "perf_get_feedback_extn");
+        if (!perf_get_feedback_extn) {
+            ALOGE("Unable to get perf_get_feedback_extn function handle.\n");
+        }
+
+        perf_event = dlsym(qcopt_handle, "perf_event");
+        if (!perf_event) {
+            ALOGE("Unable to get perf_event function handle.\n");
+        }
+
+        perf_sync_request = dlsym(qcopt_handle, "perf_sync_request");
+        if (!perf_sync_request) {
+            ALOGE("Unable to get perf_sync_request function handle.\n");
         }
 
         perf_get_prop = dlsym(qcopt_handle, "perf_get_prop");
@@ -263,11 +279,21 @@ int send_perf_get_feedback_extn(int hint_id, const char* pkg_name, int numArgs, 
     return -1;
 }
 
+int send_perf_event(int event_id, const char* pkg_name, int numArgs, int list[])
+{
+    if (qcopt_handle && perf_event) {
+        perf_event(event_id, pkg_name, numArgs, list);
+        return 0;
+    }
+    ALOGE("Failed to send perf event for event_id: %X.", event_id);
+    return -1;
+}
+
 const char* send_perf_sync_request(int hint_id)
 {
     if (qcopt_handle && perf_sync_request) {
         const char* tmp = perf_sync_request(hint_id);
-        if (tmp) {
+        if(tmp) {
             return tmp;
         } else {
             ALOGE("Failed to send perf sync request for hint_id: %X.", hint_id);
@@ -275,6 +301,7 @@ const char* send_perf_sync_request(int hint_id)
     }
     return NULL;
 }
+
 void interaction(int duration, int num_args, int opt_list[])
 {
 #ifdef INTERACTION_BOOST

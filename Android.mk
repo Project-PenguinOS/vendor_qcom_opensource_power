@@ -7,12 +7,12 @@ ifneq (,$(filter true,$(call is-vendor-board-platform,QCOM) $(TARGET_USES_QTI_PO
 include $(CLEAR_VARS)
 
 LOCAL_MODULE_RELATIVE_PATH := hw
-LOCAL_SHARED_LIBRARIES := android.hardware.common.fmq-V1-ndk libfmq libutils liblog libcutils libdl libxml2 libbase libbinder_ndk android.hardware.power-V6-ndk
+# KEYSTONE(I1132378f14428bf511f3cea4f419e90a6e89f823,b/181709127)
+LOCAL_SHARED_LIBRARIES := android.hardware.common-V2-ndk android.hardware.common.fmq-V1-ndk libfmq libutils liblog libcutils libdl libxml2 libbase libbinder_ndk android.hardware.power-V6-ndk libdisplayconfig.qti vendor.qti.hardware.display.config-V12-ndk
 LOCAL_VINTF_FRAGMENTS := power-v6.xml
-
-
 LOCAL_HEADER_LIBRARIES += libutils_headers
 LOCAL_HEADER_LIBRARIES += libhardware_headers
+LOCAL_HEADER_LIBRARIES += display_intf_headers
 LOCAL_SRC_FILES := power-common.c metadata-parser.c utils.c list.c hint-data.c powerhintparser.c Power.cpp main.cpp PowerHintSession.cpp Laminar.cpp
 LOCAL_C_INCLUDES := external/libxml2/include \
                     external/icu/icu4c/source/common
@@ -101,7 +101,7 @@ endif
 ifeq ($(TARGET_BOARD_PLATFORM), sun)
 include $(CLEAR_VARS)
 
-LOCAL_SHARED_LIBRARIES := android.hardware.common-V2-ndk android.hardware.common.fmq-V1-ndk libfmq liblog libcutils libdl libxml2 libbase libutils libbinder_ndk android.hardware.power-V5-ndk libbinder libclang_rt.ubsan_standalone
+LOCAL_SHARED_LIBRARIES := android.hardware.common-V2-ndk android.hardware.common.fmq-V1-ndk libfmq liblog libcutils libdl libxml2 libbase libutils libbinder_ndk android.hardware.power-V6-ndk libbinder libclang_rt.ubsan_standalone
 LOCAL_HEADER_LIBRARIES += libutils_headers
 LOCAL_HEADER_LIBRARIES += libhardware_headers
 LOCAL_SRC_FILES := power-common.c metadata-parser.c utils.c list.c hint-data.c powerhintparser.c Power.cpp fuzzer.cpp PowerHintSession.cpp
