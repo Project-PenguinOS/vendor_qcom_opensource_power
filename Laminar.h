@@ -40,4 +40,5 @@ class LaminarController {
     int mFloor = 0;
     int mApplied = -1;
     int mQuietFrames = 0;
+    int mFutileFrames = 0;
 };

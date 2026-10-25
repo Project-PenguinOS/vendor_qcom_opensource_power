@@ -23,6 +23,10 @@
 namespace {
 
 constexpr int kMaxFloor = 1024;
+// Stay off top clock
+constexpr int kCeiling = 640;
+// Back off when futile
+constexpr int kFutileFrames = 8;
 // A frame over target raises the floor by this much of the full range per unit of overrun.
 constexpr double kRaiseGain = 1.5;
 // Frames with room lower it more gently, so one quick frame does not drop a busy session.
@@ -124,10 +128,17 @@ void LaminarController::report(int64_t actualNanos) {
         std::lock_guard<std::mutex> lock(mLock);
         double ratio = static_cast<double>(actualNanos) / static_cast<double>(mTargetNanos);
         if (ratio > 1.0) {
-            int step = std::max(kMinStep, static_cast<int>(kRaiseGain * (ratio - 1.0) * kMaxFloor));
-            mFloor = std::min(kMaxFloor, mFloor + step);
             mQuietFrames = 0;
+            if (mFloor >= kCeiling && ++mFutileFrames >= kFutileFrames) {
+                mFloor = kCeiling / 2;
+                mFutileFrames = 0;
+            } else {
+                int step = std::max(kMinStep,
+                                    static_cast<int>(kRaiseGain * (ratio - 1.0) * kMaxFloor));
+                mFloor = std::min(kCeiling, mFloor + step);
+            }
         } else if (ratio < kRoomRatio) {
+            mFutileFrames = 0;
             if (++mQuietFrames >= kQuietFramesBeforeLowering) {
                 int step = std::max(kMinStep / 2,
                                     static_cast<int>(kLowerGain * (kRoomRatio - ratio) * kMaxFloor));
@@ -135,6 +146,7 @@ void LaminarController::report(int64_t actualNanos) {
             }
         } else {
             mQuietFrames = 0;
+            mFutileFrames = 0;
     }
     applyLocked(mFloor);
     }
@@ -144,7 +156,7 @@ void LaminarController::report(int64_t actualNanos) {
 void LaminarController::loadUp() {
     {
         std::lock_guard<std::mutex> lock(mLock);
-        mFloor = std::max(mFloor, kLoadUpFloor);
+        mFloor = std::max(mFloor, std::min(kLoadUpFloor, kCeiling));
         applyLocked(mFloor);
     }
     armIdle();
@@ -153,7 +165,7 @@ void LaminarController::loadUp() {
 void LaminarController::loadSpike() {
     {
         std::lock_guard<std::mutex> lock(mLock);
-        mFloor = kMaxFloor;
+        mFloor = kCeiling;
         applyLocked(mFloor);
     }
     armIdle();
