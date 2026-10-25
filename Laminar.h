@@ -45,6 +45,7 @@ class LaminarController {
     int mFloor = 0;
     int mApplied = -1;
     int mQuietFrames = 0;
+    int mFutileFrames = 0;
     // Highest floor of the current burst, and of the last one once the session went idle.
     int mBurstPeak = 0;
     int mLastBurstPeak = 0;
