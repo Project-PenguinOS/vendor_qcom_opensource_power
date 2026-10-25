@@ -12,7 +12,8 @@
 
 /**
  * Keeps a hint session's threads on time by raising their scheduler utilization floor
- * (uclamp.min) when frames run over the target and lowering it again when they have room.
+ * (uclamp.min) when frames run over the target and lowering it again when they have room. Sessions
+ * that report GPU time (SurfaceFlinger) also vote for a GPU frequency floor the same way.
  */
 class LaminarController {
   public:
@@ -23,7 +24,8 @@ class LaminarController {
 
     void setThreads(const std::vector<int32_t>& threads);
     void setTarget(int64_t targetNanos);
-    void report(int64_t actualNanos);
+    // cpuNanos and gpuNanos are the split of actualNanos when the session reports it, else 0.
+    void report(int64_t actualNanos, int64_t cpuNanos = 0, int64_t gpuNanos = 0);
     void loadUp();
     void loadSpike();
     // CPU_LOAD_RESET: the coming work is unknown, start from a baseline floor.
@@ -46,5 +48,8 @@ class LaminarController {
     // Highest floor of the current burst, and of the last one once the session went idle.
     int mBurstPeak = 0;
     int mLastBurstPeak = 0;
+    // This session's step on the shared GPU frequency floor.
+    int mGpuLevel = 0;
+    int mGpuQuietFrames = 0;
     std::chrono::steady_clock::time_point mLastBurstEnd;
 };

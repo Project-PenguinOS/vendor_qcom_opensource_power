@@ -312,14 +312,14 @@ ndk::ScopedAStatus PowerHintSessionImpl::updateTargetWorkDuration(int64_t in_tar
 
 ndk::ScopedAStatus PowerHintSessionImpl::reportActualWorkDuration(const std::vector<::aidl::android::hardware::power::WorkDuration>& in_durations){
     if(mLaminar && !in_durations.empty()) {
-        int64_t actualWorkDurationNanos = in_durations[0].durationNanos;
+        const auto* longest = &in_durations[0];
         for(const auto& duration : in_durations) {
-            if (duration.durationNanos > actualWorkDurationNanos) {
-                actualWorkDurationNanos = duration.durationNanos;
+            if (duration.durationNanos > longest->durationNanos) {
+                longest = &duration;
             }
         }
-        if(mEnableDebug) LOG(INFO) << "PowerHintSessionImpl::reportActualWorkDuration: laminar actual = " << actualWorkDurationNanos << " ns";
-        mLaminar->report(actualWorkDurationNanos);
+        if(mEnableDebug) LOG(INFO) << "PowerHintSessionImpl::reportActualWorkDuration: laminar actual = " << longest->durationNanos << " ns, cpu = " << longest->cpuDurationNanos << " ns, gpu = " << longest->gpuDurationNanos << " ns";
+        mLaminar->report(longest->durationNanos, longest->cpuDurationNanos, longest->gpuDurationNanos);
         return ndk::ScopedAStatus::ok();
     }
     if(!mEnableAdpf || mTargetWorkDurationNanos == -1 || in_durations.empty()) {

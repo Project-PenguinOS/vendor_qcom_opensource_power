@@ -20,6 +20,8 @@
 
 #include <android-base/logging.h>
 
+#include "utils.h"
+
 namespace {
 
 constexpr int kMaxFloor = 1024;
@@ -41,6 +43,18 @@ constexpr auto kIdleReset = std::chrono::milliseconds(150);
 constexpr int kResetFloor = 384;
 // A burst that starts this soon after the previous one ended likely needs a similar floor.
 constexpr auto kBurstMemory = std::chrono::milliseconds(1000);
+
+// GPU floor steps in MHz, all pineapple GPU power levels. Step 0 leaves the GPU to its governor.
+constexpr int kGpuStepsMhz[] = {0, 680, 770, 834, 903};
+constexpr int kGpuSteps = sizeof(kGpuStepsMhz) / sizeof(kGpuStepsMhz[0]);
+// Frames with GPU time under this share of the target count as having room.
+constexpr double kGpuRoomRatio = 0.5;
+constexpr int kGpuQuietFramesBeforeLowering = 8;
+// The floor is a perf lock lease that each GPU heavy frame renews, so it lapses on its own if
+// frames stop.
+constexpr int kGpuLeaseMs = 250;
+// Perf HAL resource: GPU minimum frequency in MHz (the same one the expensive rendering boost uses).
+constexpr int kGpuMinFreqResource = 0x4280C000;
 
 constexpr uint64_t kKeepAll = 0x18;
 constexpr uint64_t kUtilClampMin = 0x20;
@@ -71,6 +85,41 @@ std::mutex gIdleLock;
 std::condition_variable gIdleCv;
 std::unordered_map<LaminarController*, std::chrono::steady_clock::time_point> gIdleDeadlines;
 std::once_flag gIdleThreadOnce;
+
+// The GPU is shared, so the floor is the highest step any session votes for.
+std::mutex gGpuLock;
+std::unordered_map<const LaminarController*, int> gGpuVotes;
+int gGpuApplied = 0;
+int gGpuHandle = 0;
+std::chrono::steady_clock::time_point gGpuRenewed;
+
+void setGpuVote(const LaminarController* controller, int step) {
+    std::lock_guard<std::mutex> lock(gGpuLock);
+    if (step > 0) {
+        gGpuVotes[controller] = step;
+    } else {
+        gGpuVotes.erase(controller);
+    }
+    int top = 0;
+    for (const auto& [_, vote] : gGpuVotes) top = std::max(top, vote);
+
+    const auto now = std::chrono::steady_clock::now();
+    if (top == gGpuApplied &&
+        (top == 0 || now - gGpuRenewed < std::chrono::milliseconds(kGpuLeaseMs / 2))) {
+        return;
+    }
+    if (gGpuHandle > 0 && (top == 0 || top != gGpuApplied)) {
+        release_request(gGpuHandle);
+        gGpuHandle = 0;
+    }
+    gGpuApplied = top;
+    if (top == 0) return;
+
+    int args[] = {kGpuMinFreqResource, kGpuStepsMhz[top]};
+    const int handle = interaction_with_handle(gGpuHandle, kGpuLeaseMs, 2, args);
+    gGpuHandle = handle > 0 ? handle : 0;
+    gGpuRenewed = now;
+}
 
 }  // namespace
 
@@ -125,10 +174,14 @@ void LaminarController::setTarget(int64_t targetNanos) {
     if (targetNanos > 0) mTargetNanos = targetNanos;
 }
 
-void LaminarController::report(int64_t actualNanos) {
+void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gpuNanos) {
+    int gpuStep = -1;
     {
         std::lock_guard<std::mutex> lock(mLock);
-        double ratio = static_cast<double>(actualNanos) / static_cast<double>(mTargetNanos);
+        // The utilization floor only helps the CPU part of the work. When the session reports the
+        // split, GPU bound frames must not raise it.
+        const int64_t cpuWork = cpuNanos > 0 ? cpuNanos : actualNanos;
+        double ratio = static_cast<double>(cpuWork) / static_cast<double>(mTargetNanos);
         if (ratio > 1.0) {
             int step = std::max(kMinStep, static_cast<int>(kRaiseGain * (ratio - 1.0) * kMaxFloor));
             mFloor = std::min(kMaxFloor, mFloor + step);
@@ -144,7 +197,25 @@ void LaminarController::report(int64_t actualNanos) {
         }
         mBurstPeak = std::max(mBurstPeak, mFloor);
         applyLocked(mFloor);
+
+        if (gpuNanos > 0) {
+            const double gpuRatio =
+                    static_cast<double>(gpuNanos) / static_cast<double>(mTargetNanos);
+            if (gpuRatio > 1.0) {
+                mGpuLevel = std::min(kGpuSteps - 1, mGpuLevel + (gpuRatio > 1.5 ? 2 : 1));
+                mGpuQuietFrames = 0;
+            } else if (gpuRatio < kGpuRoomRatio) {
+                if (++mGpuQuietFrames >= kGpuQuietFramesBeforeLowering) {
+                    mGpuLevel = std::max(0, mGpuLevel - 1);
+                    mGpuQuietFrames = 0;
+                }
+            } else {
+                mGpuQuietFrames = 0;
+            }
+            gpuStep = mGpuLevel;
+        }
     }
+    if (gpuStep >= 0) setGpuVote(this, gpuStep);
     armIdle();
 }
 
@@ -196,6 +267,9 @@ void LaminarController::resetIfIdle() {
     mFloor = 0;
     mQuietFrames = 0;
     applyLocked(0);
+    mGpuLevel = 0;
+    mGpuQuietFrames = 0;
+    setGpuVote(this, 0);
 }
 
 void LaminarController::reset() {
@@ -203,6 +277,9 @@ void LaminarController::reset() {
     mFloor = 0;
     mQuietFrames = 0;
     applyLocked(0);
+    mGpuLevel = 0;
+    mGpuQuietFrames = 0;
+    setGpuVote(this, 0);
 }
 
 void LaminarController::applyLocked(int value) {
