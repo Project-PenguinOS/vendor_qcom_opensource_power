@@ -658,6 +658,12 @@
         <Config
             Id="0x000010A5" Enable="true" Timeout="0" Target="ukee"
             Resources="0x42804000, 3"/>
+        <Config
+            Id="0x000010A5" Enable="true" Timeout="0" Target="cape"
+            Resources="0x42804000, 3"/>
+        <Config
+            Id="0x000010A5" Enable="true" Timeout="0" Target="taro"
+            Resources="0x42804000, 3"/>
 
         <!--camera ZSLPreview-->
         <!--CPU-LLC BWMON - Set sample_ms 33-->
