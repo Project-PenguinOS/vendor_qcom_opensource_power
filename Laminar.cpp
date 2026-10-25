@@ -13,11 +13,15 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <sstream>
+#include <string>
 #include <sys/syscall.h>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
 
+#include <android-base/file.h>
 #include <android-base/logging.h>
 
 #include "utils.h"
@@ -44,9 +48,9 @@ constexpr int kResetFloor = 384;
 // A burst that starts this soon after the previous one ended likely needs a similar floor.
 constexpr auto kBurstMemory = std::chrono::milliseconds(1000);
 
-// GPU floor steps in MHz, all pineapple GPU power levels. Step 0 leaves the GPU to its governor.
-constexpr int kGpuStepsMhz[] = {0, 680, 770, 834, 903};
-constexpr int kGpuSteps = sizeof(kGpuStepsMhz) / sizeof(kGpuStepsMhz[0]);
+// Start GPU votes at a share of this device's maximum clock, then climb its supported levels.
+// Frequencies themselves are discovered from the driver, never copied from another SoC.
+constexpr int kGpuMinFloorPercent = 75;
 // Frames with GPU time under this share of the target count as having room.
 constexpr double kGpuRoomRatio = 0.5;
 constexpr int kGpuQuietFramesBeforeLowering = 8;
@@ -55,6 +59,47 @@ constexpr int kGpuQuietFramesBeforeLowering = 8;
 constexpr int kGpuLeaseMs = 250;
 // Perf HAL resource: GPU minimum frequency in MHz (the same one the expensive rendering boost uses).
 constexpr int kGpuMinFreqResource = 0x4280C000;
+
+// Read once when GPU work is first reported; frame reports do not perform sysfs I/O afterward.
+const std::vector<int>& gpuStepsMhz() {
+    static const std::vector<int> steps = [] {
+        constexpr const char* paths[] = {
+                "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies",
+                "/sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies",
+        };
+        for (const char* path : paths) {
+            std::string contents;
+            if (!android::base::ReadFileToString(path, &contents)) continue;
+
+            std::istringstream input(contents);
+            std::vector<int> frequencies;
+            int64_t frequencyHz;
+            while (input >> frequencyHz) {
+                // KGSL/devfreq expose Hz, while the perf resource takes integer MHz.
+                const int64_t mhz = frequencyHz / 1'000'000;
+                if (mhz > 0 && mhz <= std::numeric_limits<int>::max()) {
+                    frequencies.push_back(static_cast<int>(mhz));
+                }
+            }
+            if (frequencies.empty()) continue;
+            std::sort(frequencies.begin(), frequencies.end());
+            frequencies.erase(std::unique(frequencies.begin(), frequencies.end()),
+                              frequencies.end());
+
+            const int64_t minimum =
+                    (static_cast<int64_t>(frequencies.back()) * kGpuMinFloorPercent + 99) / 100;
+            const auto first = std::lower_bound(frequencies.begin(), frequencies.end(), minimum);
+            std::vector<int> levels = {0};  // No vote: leave the clock to the governor.
+            levels.insert(levels.end(), first, frequencies.end());
+            LOG(INFO) << "GPU floor uses " << levels.size() - 1
+                      << " driver levels up to " << levels.back() << " MHz";
+            return levels;
+        }
+        LOG(WARNING) << "No readable GPU frequency table; keeping CPU hints without GPU votes";
+        return std::vector<int>{0};
+    }();
+    return steps;
+}
 
 constexpr uint64_t kKeepAll = 0x18;
 constexpr uint64_t kUtilClampMin = 0x20;
@@ -115,7 +160,7 @@ void setGpuVote(const LaminarController* controller, int step) {
     gGpuApplied = top;
     if (top == 0) return;
 
-    int args[] = {kGpuMinFreqResource, kGpuStepsMhz[top]};
+    int args[] = {kGpuMinFreqResource, gpuStepsMhz()[top]};
     const int handle = interaction_with_handle(gGpuHandle, kGpuLeaseMs, 2, args);
     gGpuHandle = handle > 0 ? handle : 0;
     gGpuRenewed = now;
@@ -202,7 +247,8 @@ void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gp
             const double gpuRatio =
                     static_cast<double>(gpuNanos) / static_cast<double>(mTargetNanos);
             if (gpuRatio > 1.0) {
-                mGpuLevel = std::min(kGpuSteps - 1, mGpuLevel + (gpuRatio > 1.5 ? 2 : 1));
+                const int maxLevel = static_cast<int>(gpuStepsMhz().size()) - 1;
+                mGpuLevel = std::min(maxLevel, mGpuLevel + (gpuRatio > 1.5 ? 2 : 1));
                 mGpuQuietFrames = 0;
             } else if (gpuRatio < kGpuRoomRatio) {
                 if (++mGpuQuietFrames >= kGpuQuietFramesBeforeLowering) {
