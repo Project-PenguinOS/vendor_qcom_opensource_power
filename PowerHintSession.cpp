@@ -426,6 +426,11 @@ void PowerHintSessionImpl::boostGpu() {
 
 ndk::ScopedAStatus PowerHintSessionImpl::sendHint(aidl::android::hardware::power::SessionHint hint){
     if(mEnableDebug) LOG(INFO) << "PowerHintSessionImpl::sendHint: " << static_cast<int32_t>(hint);
+    // CPU_LOAD_RESET must wake the session up if it is inactive.
+    if(mLaminar && hint == aidl::android::hardware::power::SessionHint::CPU_LOAD_RESET &&
+            isSessionAlive(this) && !isSessionActive(this)) {
+        setSessionActivity(this, true);
+    }
     if(mLaminar && isSessionActive(this)) {
         switch(hint) {
             case aidl::android::hardware::power::SessionHint::CPU_LOAD_UP:
@@ -435,7 +440,7 @@ ndk::ScopedAStatus PowerHintSessionImpl::sendHint(aidl::android::hardware::power
                 mLaminar->loadSpike();
                 return ndk::ScopedAStatus::ok();
             case aidl::android::hardware::power::SessionHint::CPU_LOAD_RESET:
-                mLaminar->reset();
+                mLaminar->rebaseline();
                 return ndk::ScopedAStatus::ok();
             default:
                 break;

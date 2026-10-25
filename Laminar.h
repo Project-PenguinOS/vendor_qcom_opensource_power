@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -25,6 +26,8 @@ class LaminarController {
     void report(int64_t actualNanos);
     void loadUp();
     void loadSpike();
+    // CPU_LOAD_RESET: the coming work is unknown, start from a baseline floor.
+    void rebaseline();
     void reset();
 
   private:
@@ -40,4 +43,8 @@ class LaminarController {
     int mFloor = 0;
     int mApplied = -1;
     int mQuietFrames = 0;
+    // Highest floor of the current burst, and of the last one once the session went idle.
+    int mBurstPeak = 0;
+    int mLastBurstPeak = 0;
+    std::chrono::steady_clock::time_point mLastBurstEnd;
 };

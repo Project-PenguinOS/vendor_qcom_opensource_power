@@ -35,6 +35,12 @@ constexpr int kApplyThreshold = 16;
 constexpr int kLoadUpFloor = 512;
 // A session that stops reporting frames is idle; its floor drops back after this long.
 constexpr auto kIdleReset = std::chrono::milliseconds(150);
+// Floor for the first frames after CPU_LOAD_RESET, which HWUI sends when it starts drawing again
+// after 100 ms without frames (a new touch, fling or animation). Those frames have no history to
+// react to, so starting them at 0 made every gesture miss its first frames.
+constexpr int kResetFloor = 384;
+// A burst that starts this soon after the previous one ended likely needs a similar floor.
+constexpr auto kBurstMemory = std::chrono::milliseconds(1000);
 
 constexpr uint64_t kKeepAll = 0x18;
 constexpr uint64_t kUtilClampMin = 0x20;
@@ -135,8 +141,9 @@ void LaminarController::report(int64_t actualNanos) {
             }
         } else {
             mQuietFrames = 0;
-    }
-    applyLocked(mFloor);
+        }
+        mBurstPeak = std::max(mBurstPeak, mFloor);
+        applyLocked(mFloor);
     }
     armIdle();
 }
@@ -159,6 +166,21 @@ void LaminarController::loadSpike() {
     armIdle();
 }
 
+void LaminarController::rebaseline() {
+    {
+        std::lock_guard<std::mutex> lock(mLock);
+        int floor = kResetFloor;
+        if (std::chrono::steady_clock::now() - mLastBurstEnd < kBurstMemory) {
+            floor = std::max(floor, mLastBurstPeak * 3 / 4);
+        }
+        mFloor = std::min(kMaxFloor, floor);
+        mQuietFrames = 0;
+        mBurstPeak = mFloor;
+        applyLocked(mFloor);
+    }
+    armIdle();
+}
+
 void LaminarController::armIdle() {
     std::call_once(gIdleThreadOnce, [] { std::thread(laminarIdleLoop).detach(); });
     std::lock_guard<std::mutex> lock(gIdleLock);
@@ -168,6 +190,9 @@ void LaminarController::armIdle() {
 
 void LaminarController::resetIfIdle() {
     std::lock_guard<std::mutex> lock(mLock);
+    mLastBurstPeak = mBurstPeak;
+    mLastBurstEnd = std::chrono::steady_clock::now();
+    mBurstPeak = 0;
     mFloor = 0;
     mQuietFrames = 0;
     applyLocked(0);
