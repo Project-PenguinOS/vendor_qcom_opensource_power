@@ -24,7 +24,6 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 
-#include "utils.h"
 
 namespace {
 
@@ -56,15 +55,13 @@ constexpr int kGpuMinFloorPercent = 75;
 // Frames with GPU time under this share of the target count as having room.
 constexpr double kGpuRoomRatio = 0.5;
 constexpr int kGpuQuietFramesBeforeLowering = 8;
-// The floor is a perf lock lease that each GPU heavy frame renews, so it lapses on its own if
-// frames stop.
+// Each GPU vote expires independently, including when CPU-only reports keep a session alive.
 constexpr int kGpuLeaseMs = 250;
-// Perf HAL resource: GPU minimum frequency in MHz (the same one the expensive rendering boost uses).
-constexpr int kGpuMinFreqResource = 0x4280C000;
+constexpr const char* kGpuMinFreqPath = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
 
-// Read once when GPU work is first reported; frame reports do not perform sysfs I/O afterward.
-const std::vector<int>& gpuStepsMhz() {
-    static const std::vector<int> steps = [] {
+// Discover supported levels once; only floor transitions write sysfs afterward.
+const std::vector<int64_t>& gpuStepsHz() {
+    static const std::vector<int64_t> steps = [] {
         constexpr const char* paths[] = {
                 "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies",
                 "/sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies",
@@ -74,13 +71,12 @@ const std::vector<int>& gpuStepsMhz() {
             if (!android::base::ReadFileToString(path, &contents)) continue;
 
             std::istringstream input(contents);
-            std::vector<int> frequencies;
+            std::vector<int64_t> frequencies;
             int64_t frequencyHz;
             while (input >> frequencyHz) {
-                // KGSL/devfreq expose Hz, while the perf resource takes integer MHz.
-                const int64_t mhz = frequencyHz / 1'000'000;
-                if (mhz > 0 && mhz <= std::numeric_limits<int>::max()) {
-                    frequencies.push_back(static_cast<int>(mhz));
+                // Keep exact driver frequencies, including fractional MHz steps.
+                if (frequencyHz > 0 && frequencyHz <= 10'000'000'000LL) {
+                    frequencies.push_back(frequencyHz);
                 }
             }
             if (frequencies.empty()) continue;
@@ -91,14 +87,14 @@ const std::vector<int>& gpuStepsMhz() {
             const int64_t minimum =
                     (static_cast<int64_t>(frequencies.back()) * kGpuMinFloorPercent + 99) / 100;
             const auto first = std::lower_bound(frequencies.begin(), frequencies.end(), minimum);
-            std::vector<int> levels = {0};  // No vote: leave the clock to the governor.
+            std::vector<int64_t> levels = {0};  // No vote: leave the clock to the governor.
             levels.insert(levels.end(), first, frequencies.end());
             LOG(INFO) << "GPU floor uses " << levels.size() - 1
-                      << " driver levels up to " << levels.back() << " MHz";
+                      << " driver levels up to " << levels.back() << " Hz";
             return levels;
         }
         LOG(WARNING) << "No readable GPU frequency table; keeping CPU hints without GPU votes";
-        return std::vector<int>{0};
+        return std::vector<int64_t>{0};
     }();
     return steps;
 }
@@ -134,38 +130,76 @@ std::unordered_map<LaminarController*, std::chrono::steady_clock::time_point> gI
 std::once_flag gIdleThreadOnce;
 
 // The GPU is shared, so the floor is the highest step any session votes for.
+struct GpuVote {
+    int step;
+    std::chrono::steady_clock::time_point deadline;
+};
 std::mutex gGpuLock;
-std::unordered_map<const LaminarController*, int> gGpuVotes;
+std::condition_variable gGpuCv;
+std::unordered_map<const LaminarController*, GpuVote> gGpuVotes;
+std::once_flag gGpuThreadOnce;
 int gGpuApplied = 0;
-int gGpuHandle = 0;
-std::chrono::steady_clock::time_point gGpuRenewed;
+std::string gGpuBaseline;
+bool gGpuWriteFailed = false;
+
+// Caller holds gGpuLock. Preserve the pre-existing floor when our last vote ends.
+void applyGpuVoteLocked() {
+    int top = 0;
+    for (const auto& [_, vote] : gGpuVotes) top = std::max(top, vote.step);
+    if (top == gGpuApplied) {
+        if (top == 0) gGpuBaseline.clear();
+        return;
+    }
+    if (gGpuApplied == 0 && gGpuBaseline.empty() &&
+        !android::base::ReadFileToString(kGpuMinFreqPath, &gGpuBaseline)) {
+        if (!gGpuWriteFailed) PLOG(WARNING) << "Cannot read GPU minimum frequency";
+        gGpuWriteFailed = true;
+        return;
+    }
+    // Do not lower a higher floor that another owner had already requested.
+    const std::string value = top == 0 ? gGpuBaseline : std::to_string(std::max<int64_t>(
+            gpuStepsHz()[top], std::strtoll(gGpuBaseline.c_str(), nullptr, 10)));
+    if (!android::base::WriteStringToFile(value, kGpuMinFreqPath)) {
+        if (!gGpuWriteFailed) PLOG(WARNING) << "Cannot write GPU minimum frequency";
+        gGpuWriteFailed = true;
+        return;
+    }
+    gGpuWriteFailed = false;
+    gGpuApplied = top;
+    if (top == 0) gGpuBaseline.clear();
+}
+
+void gpuLeaseLoop() {
+    std::unique_lock<std::mutex> lock(gGpuLock);
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = gGpuVotes.begin(); it != gGpuVotes.end();) {
+            if (it->second.deadline <= now) it = gGpuVotes.erase(it);
+            else ++it;
+        }
+        applyGpuVoteLocked();
+        if (gGpuVotes.empty() && gGpuApplied == 0) {
+            gGpuCv.wait(lock);
+        } else {
+            // Also retry a failed release; an I/O error must not strand a high floor.
+            auto next = now + std::chrono::milliseconds(kGpuLeaseMs);
+            for (const auto& [_, vote] : gGpuVotes) next = std::min(next, vote.deadline);
+            gGpuCv.wait_until(lock, next);
+        }
+    }
+}
 
 void setGpuVote(const LaminarController* controller, int step) {
+    std::call_once(gGpuThreadOnce, [] { std::thread(gpuLeaseLoop).detach(); });
     std::lock_guard<std::mutex> lock(gGpuLock);
-    if (step > 0) {
-        gGpuVotes[controller] = step;
+    if (step > 0 && step < static_cast<int>(gpuStepsHz().size())) {
+        gGpuVotes[controller] = {step, std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(kGpuLeaseMs)};
     } else {
         gGpuVotes.erase(controller);
     }
-    int top = 0;
-    for (const auto& [_, vote] : gGpuVotes) top = std::max(top, vote);
-
-    const auto now = std::chrono::steady_clock::now();
-    if (top == gGpuApplied &&
-        (top == 0 || now - gGpuRenewed < std::chrono::milliseconds(kGpuLeaseMs / 2))) {
-        return;
-    }
-    if (gGpuHandle > 0 && (top == 0 || top != gGpuApplied)) {
-        release_request(gGpuHandle);
-        gGpuHandle = 0;
-    }
-    gGpuApplied = top;
-    if (top == 0) return;
-
-    int args[] = {kGpuMinFreqResource, gpuStepsMhz()[top]};
-    const int handle = interaction_with_handle(gGpuHandle, kGpuLeaseMs, 2, args);
-    gGpuHandle = handle > 0 ? handle : 0;
-    gGpuRenewed = now;
+    applyGpuVoteLocked();
+    gGpuCv.notify_one();
 }
 
 }  // namespace
@@ -222,7 +256,6 @@ void LaminarController::setTarget(int64_t targetNanos) {
 }
 
 void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gpuNanos) {
-    int gpuStep = -1;
     {
         std::lock_guard<std::mutex> lock(mLock);
         // The utilization floor only helps the CPU part of the work. When the session reports the
@@ -257,7 +290,7 @@ void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gp
             const double gpuRatio =
                     static_cast<double>(gpuNanos) / static_cast<double>(mTargetNanos);
             if (gpuRatio > 1.0) {
-                const int maxLevel = static_cast<int>(gpuStepsMhz().size()) - 1;
+                const int maxLevel = static_cast<int>(gpuStepsHz().size()) - 1;
                 mGpuLevel = std::min(maxLevel, mGpuLevel + (gpuRatio > 1.5 ? 2 : 1));
                 mGpuQuietFrames = 0;
             } else if (gpuRatio < kGpuRoomRatio) {
@@ -268,10 +301,10 @@ void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gp
             } else {
                 mGpuQuietFrames = 0;
             }
-            gpuStep = mGpuLevel;
+            // Serialize against reset()/pause so an older report cannot resurrect a vote.
+            setGpuVote(this, mGpuLevel);
         }
     }
-    if (gpuStep >= 0) setGpuVote(this, gpuStep);
     armIdle();
 }
 

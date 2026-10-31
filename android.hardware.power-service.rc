@@ -3,3 +3,14 @@ service vendor.power /vendor/bin/hw/android.hardware.power-service
     user system
     group system
     capabilities SYS_NICE
+
+# Laminar controls only the GPU frequency floor; missing KGSL nodes are harmless.
+on post-fs-data
+    chown system system /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+    chmod 0664 /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+
+# A crashed/stopped service cannot run its userspace lease watchdog.
+on property:init.svc.vendor.power=stopped
+    write /sys/class/kgsl/kgsl-3d0/devfreq/min_freq 0
+on property:init.svc.vendor.power=restarting
+    write /sys/class/kgsl/kgsl-3d0/devfreq/min_freq 0
