@@ -21,6 +21,7 @@ class LaminarController {
     ~LaminarController();
 
     static bool enabled();
+    static void setExpensiveRendering(bool expected);
 
     void setThreads(const std::vector<int32_t>& threads);
     void setTarget(int64_t targetNanos);

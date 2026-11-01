@@ -47,6 +47,7 @@
 
  #include "Power.h"
  #include "PowerHintSession.h"
+ #include "Laminar.h"
  #include "utils.h"
 
  #include <android-base/logging.h>
@@ -114,7 +115,8 @@ extern bool setDeviceSpecificMode(Mode type, bool enabled);
              LOG(INFO) << "Mode " << static_cast<int32_t>(type) << "Not Supported";
              break;
          case Mode::EXPENSIVE_RENDERING:
-             set_expensive_rendering(enabled);
+             if (is_expensive_rendering_supported()) set_expensive_rendering(enabled);
+             LaminarController::setExpensiveRendering(enabled);
              break;
          case Mode::INTERACTIVE:
              setInteractive(enabled);
@@ -142,11 +144,7 @@ extern bool setDeviceSpecificMode(Mode type, bool enabled);
 
      switch(type){
          case Mode::EXPENSIVE_RENDERING:
-             if (is_expensive_rendering_supported()) {
-                 *_aidl_return = true;
-             } else {
-                 *_aidl_return = false;
-             }
+             *_aidl_return = true;
              break;
          case Mode::INTERACTIVE:
          case Mode::SUSTAINED_PERFORMANCE:

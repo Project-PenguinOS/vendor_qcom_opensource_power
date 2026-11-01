@@ -8,6 +8,7 @@
 #include "Laminar.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -51,7 +52,7 @@ constexpr auto kBurstMemory = std::chrono::milliseconds(1000);
 
 // Start GPU votes at a share of this device's maximum clock, then climb its supported levels.
 // Frequencies themselves are discovered from the driver, never copied from another SoC.
-constexpr int kGpuMinFloorPercent = 60;
+constexpr int kGpuMinFloorPercent = 45;
 // Frames with GPU time under this share of the target count as having room.
 constexpr double kGpuRoomRatio = 0.5;
 // GPU limited: SurfaceFlinger composes on the GPU after its CPU work, so both add up.
@@ -61,6 +62,8 @@ constexpr int kGpuQuietFramesBeforeLowering = 24;
 // Each GPU vote expires independently, including when CPU-only reports keep a session alive.
 constexpr int kGpuLeaseMs = 250;
 constexpr const char* kGpuMinFreqPath = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
+// The vote lasts only while frames keep being reported
+constexpr int kExpensiveRenderingLeaseMs = 100;
 
 // Discover supported levels once; only floor transitions write sysfs afterward.
 const std::vector<int64_t>& gpuStepsHz() {
@@ -139,7 +142,7 @@ struct GpuVote {
 };
 std::mutex gGpuLock;
 std::condition_variable gGpuCv;
-std::unordered_map<const LaminarController*, GpuVote> gGpuVotes;
+std::unordered_map<const void*, GpuVote> gGpuVotes;
 std::once_flag gGpuThreadOnce;
 int gGpuApplied = 0;
 std::string gGpuBaseline;
@@ -192,18 +195,21 @@ void gpuLeaseLoop() {
     }
 }
 
-void setGpuVote(const LaminarController* controller, int step) {
+void setGpuVote(const void* owner, int step, int leaseMs = kGpuLeaseMs) {
     std::call_once(gGpuThreadOnce, [] { std::thread(gpuLeaseLoop).detach(); });
     std::lock_guard<std::mutex> lock(gGpuLock);
     if (step > 0 && step < static_cast<int>(gpuStepsHz().size())) {
-        gGpuVotes[controller] = {step, std::chrono::steady_clock::now() +
-                                     std::chrono::milliseconds(kGpuLeaseMs)};
+        gGpuVotes[owner] = {step, std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(leaseMs)};
     } else {
-        gGpuVotes.erase(controller);
+        gGpuVotes.erase(owner);
     }
     applyGpuVoteLocked();
     gGpuCv.notify_one();
 }
+
+const int gExpensiveRenderingOwner = 0;
+std::atomic<bool> gExpensiveRendering = false;
 
 }  // namespace
 
@@ -244,6 +250,12 @@ bool LaminarController::enabled() {
     return true;
 }
 
+// Sent just before SurfaceFlinger composes blur or a color conversion on the GPU
+void LaminarController::setExpensiveRendering(bool expected) {
+    gExpensiveRendering = expected;
+    setGpuVote(&gExpensiveRenderingOwner, expected ? 1 : 0, kExpensiveRenderingLeaseMs);
+}
+
 void LaminarController::setThreads(const std::vector<int32_t>& threads) {
     std::lock_guard<std::mutex> lock(mLock);
     int floor = mApplied;
@@ -259,6 +271,9 @@ void LaminarController::setTarget(int64_t targetNanos) {
 }
 
 void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gpuNanos) {
+    if (gExpensiveRendering) {
+        setGpuVote(&gExpensiveRenderingOwner, 1, kExpensiveRenderingLeaseMs);
+    }
     {
         std::lock_guard<std::mutex> lock(mLock);
         // The utilization floor only helps the CPU part of the work. When the session reports the
