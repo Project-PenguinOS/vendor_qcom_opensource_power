@@ -51,10 +51,13 @@ constexpr auto kBurstMemory = std::chrono::milliseconds(1000);
 
 // Start GPU votes at a share of this device's maximum clock, then climb its supported levels.
 // Frequencies themselves are discovered from the driver, never copied from another SoC.
-constexpr int kGpuMinFloorPercent = 75;
+constexpr int kGpuMinFloorPercent = 60;
 // Frames with GPU time under this share of the target count as having room.
 constexpr double kGpuRoomRatio = 0.5;
-constexpr int kGpuQuietFramesBeforeLowering = 8;
+// GPU limited: SurfaceFlinger composes on the GPU after its CPU work, so both add up.
+constexpr double kGpuLateShare = 0.5;
+// Lower one step only after about 200 ms of easy frames at 120 Hz
+constexpr int kGpuQuietFramesBeforeLowering = 24;
 // Each GPU vote expires independently, including when CPU-only reports keep a session alive.
 constexpr int kGpuLeaseMs = 250;
 constexpr const char* kGpuMinFreqPath = "/sys/class/kgsl/kgsl-3d0/devfreq/min_freq";
@@ -289,11 +292,14 @@ void LaminarController::report(int64_t actualNanos, int64_t cpuNanos, int64_t gp
         if (gpuNanos > 0) {
             const double gpuRatio =
                     static_cast<double>(gpuNanos) / static_cast<double>(mTargetNanos);
-            if (gpuRatio > 1.0) {
+            const double actualRatio =
+                    static_cast<double>(actualNanos) / static_cast<double>(mTargetNanos);
+            if (gpuRatio > 1.0 || (actualRatio > 1.0 && gpuRatio >= kGpuLateShare)) {
                 const int maxLevel = static_cast<int>(gpuStepsHz().size()) - 1;
-                mGpuLevel = std::min(maxLevel, mGpuLevel + (gpuRatio > 1.5 ? 2 : 1));
+                const bool farBehind = gpuRatio > 1.5 || actualRatio > 1.5;
+                mGpuLevel = std::min(maxLevel, mGpuLevel + (farBehind ? 2 : 1));
                 mGpuQuietFrames = 0;
-            } else if (gpuRatio < kGpuRoomRatio) {
+            } else if (gpuRatio < kGpuRoomRatio && actualRatio < kRoomRatio) {
                 if (++mGpuQuietFrames >= kGpuQuietFramesBeforeLowering) {
                     mGpuLevel = std::max(0, mGpuLevel - 1);
                     mGpuQuietFrames = 0;
