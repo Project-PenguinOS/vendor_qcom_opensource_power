@@ -1,5 +1,39 @@
-cc_library_headers {
-    name: "qti_powerhal_headers",
-    vendor_available: true,
-    export_include_dirs: ["."],
+rust_defaults {
+    name: "android.hardware.power-service-defaults",
+    vendor: true,
+    prefer_rlib: true,
+    srcs: ["main.rs"],
+    rustlibs: [
+        "android.hardware.power-V6-rust",
+        "libbinder_rs",
+        "liblibc",
+        "liblog_rust",
+        "liblogger",
+    ] + select(soong_config_variable("qti_power", "mode_ext"), {
+        // A device extension: a crate named power_ext, see ext_default.rs.
+        any @ flag_val: [flag_val],
+        default: ["libpower_ext_default"],
+    }),
+}
+
+rust_binary {
+    name: "android.hardware.power-service",
+    defaults: ["android.hardware.power-service-defaults"],
+    relative_install_path: "hw",
+    init_rc: ["android.hardware.power-service.rc"],
+    vintf_fragments: ["power-v6.xml"],
+}
+
+rust_test {
+    name: "android.hardware.power-service-test",
+    defaults: ["android.hardware.power-service-defaults"],
+    test_suites: ["general-tests"],
+}
+
+rust_library {
+    name: "libpower_ext_default",
+    crate_name: "power_ext",
+    vendor: true,
+    srcs: ["ext_default.rs"],
+    rustlibs: ["android.hardware.power-V6-rust"],
 }
