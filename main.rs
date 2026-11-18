@@ -35,7 +35,7 @@ use android_hardware_power::aidl::android::hardware::power::{
     },
 };
 use binder::{BinderFeatures, ExceptionCode, Interface, Status, Strong};
-use log::{debug, error, info, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use session::PowerHintSession;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -53,6 +53,9 @@ const GPU_HEADROOM_MIN: i32 = 3;
 const CPU_HEADROOM_TOTAL: i32 = 6;
 const HEADROOM_MIN_WINDOW_MS: i32 = 1000;
 const HEADROOM_MAX_WINDOW_MS: i32 = 60000;
+
+static CPU_HEADROOM: OnceLock<bool> = OnceLock::new();
+static GPU_HEADROOM: OnceLock<bool> = OnceLock::new();
 
 /// Extra Binder threads: sessions are independent, so one app's reports need not queue behind
 /// another's.
@@ -82,6 +85,18 @@ fn headroom(feedback: i32, kind: i32, window_s: i32, failed: &AtomicBool) -> Opt
         return None;
     }
     Some(value as f32)
+}
+
+/// Whether the perf HAL answers a headroom query at all. Probed once, when the framework reads
+/// SupportInfo at boot: an unanswered query must be reported as unsupported, because an empty
+/// result reaches apps as a headroom of 0 (no capacity left). On sun the perf HAL fails the CPU
+/// query and answers 0 to the GPU one even with the GPU idle, so 0 counts as no answer too.
+fn headroom_available(feedback: i32, kind: i32) -> bool {
+    let available = perf::get_feedback_extn(feedback, &mut [kind, 1]) > 0;
+    if !available {
+        warn!("Headroom {feedback:#X} is not available, reporting it unsupported");
+    }
+    available
 }
 
 struct Power {
@@ -236,8 +251,12 @@ impl IPower for Power {
                 alwaysBatch: false,
             },
             headroom: HeadroomSupportInfo {
-                isCpuSupported: true,
-                isGpuSupported: true,
+                isCpuSupported: *CPU_HEADROOM.get_or_init(|| {
+                    headroom_available(VENDOR_FEEDBACK_CPU_HEADROOM, CPU_HEADROOM_TOTAL)
+                }),
+                isGpuSupported: *GPU_HEADROOM.get_or_init(|| {
+                    headroom_available(VENDOR_FEEDBACK_GPU_HEADROOM, GPU_HEADROOM_AVG)
+                }),
                 cpuMinIntervalMillis: 1000,
                 gpuMinIntervalMillis: 1000,
                 cpuMinCalculationWindowMillis: 50,
