@@ -13,7 +13,7 @@ use android_hardware_power::aidl::android::hardware::power::{
 };
 use binder::{ExceptionCode, Interface, Status};
 use log::{debug, error, info};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -78,12 +78,28 @@ fn boost_eligible() -> bool {
     true
 }
 
+/// Top app hint failures before the first success, or -1 once it worked. Past the limit the
+/// perf HAL is taken to lack the hint (pineapple's perfboostsconfig has none) and it is no
+/// longer sent.
+static TOP_APP_HINT_FAILURES: AtomicI32 = AtomicI32::new(0);
+const TOP_APP_HINT_MAX_FAILURES: i32 = 3;
+
 /// The top app, when the perf HAL classifies it as a game. ADPF hints only apply to those.
 fn game_top_app() -> Option<String> {
-    let name = perf::sync_request(VENDOR_FEEDBACK_TOPAPP_NAME)?;
-    if perf::hint(VENDOR_HINT_PICARD_TOP_APP, &name, 0, 0) == -1 {
+    if TOP_APP_HINT_FAILURES.load(Ordering::Relaxed) >= TOP_APP_HINT_MAX_FAILURES {
         return None;
     }
+    let name = perf::sync_request(VENDOR_FEEDBACK_TOPAPP_NAME)?;
+    if perf::hint(VENDOR_HINT_PICARD_TOP_APP, &name, 0, 0) == -1 {
+        if TOP_APP_HINT_FAILURES.load(Ordering::Relaxed) >= 0
+            && TOP_APP_HINT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1
+                == TOP_APP_HINT_MAX_FAILURES
+        {
+            info!("The perf HAL has no top app hint, game detection is off");
+        }
+        return None;
+    }
+    TOP_APP_HINT_FAILURES.store(-1, Ordering::Relaxed);
     (perf::get_feedback(VENDOR_FEEDBACK_WORKLOAD_TYPE, &name) == GAME_WORKLOAD_TYPE).then_some(name)
 }
 
